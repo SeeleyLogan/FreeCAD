@@ -43,6 +43,9 @@ def traverse_objects_once(objects):
             if mat_name not in materials:
                 materials.append(mat_name)
 
+        if hasattr(obj, "Shape") and obj.Shape:
+            FreeCAD.Console.PrintMessage(f"{obj}: {obj.Shape}\n\n")
+
         if (
             hasattr(obj, "TypeId")
             and obj.TypeId == "App::VarSet"
