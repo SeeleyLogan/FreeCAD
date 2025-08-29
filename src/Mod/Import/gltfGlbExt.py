@@ -16,6 +16,7 @@ def traverse_objects_once(objects):
     all_objects = []
     materials = []
     varsets = {}
+    matrices = {}
 
     stack = [(obj, obj.Label if hasattr(obj, "Label") else "Unknown") for obj in objects]
     visited = set()
@@ -43,10 +44,21 @@ def traverse_objects_once(objects):
             if mat_name not in materials:
                 materials.append(mat_name)
 
-        if hasattr(obj, "Shape") and obj.Shape:
-            FreeCAD.Console.PrintMessage(f"{obj}: {obj.Shape}\n\n")
+        resolved_obj, resolved_placement = resolve_link_chain(obj)
+        bbox = None
 
-        if (
+        if hasattr(resolved_obj, "Shape"):
+            bbox = calculate_bbox(resolved_obj.Shape)
+
+        if (hasattr(obj, "TypeId") and obj.TypeId == "PartDesign::Body" and bbox is not None) or \
+        (hasattr(resolved_obj, "TypeId") and resolved_obj.TypeId == "PartDesign::Body" and bbox is not None):
+            bbox_placement = FreeCAD.Placement(bbox['center'], bbox['rotation'])
+            world_to_bbox = bbox_placement.inverse()
+
+            if obj.Label not in matrices:
+                matrices[obj.Label] = placement_to_matrix(world_to_bbox)
+
+        if ( 
             hasattr(obj, "TypeId")
             and obj.TypeId == "App::VarSet"
             and hasattr(obj, "PropertiesList")
@@ -72,10 +84,141 @@ def traverse_objects_once(objects):
         if hasattr(obj, "LinkedObject") and obj.LinkedObject:
             stack.append((obj.LinkedObject, current_path))
 
-    return all_objects, materials, varsets
+    return all_objects, materials, varsets, matrices
 
 
-def modify_gltf_data(gltf_data, materials, varsets):
+def calculate_bbox(shape):
+    """Calculate box aligned with shape's placement"""
+    import numpy as np
+
+    if hasattr(shape, 'Placement'):
+        shape_placement = shape.Placement
+    else:
+        parent = [obj for obj in FreeCAD.ActiveDocument.Objects if hasattr(obj, 'Shape') and obj.Shape == shape]
+        if parent:
+            shape_placement = parent[0].Placement
+        else:
+            shape_placement = FreeCAD.Placement()
+    
+    vertices = np.array([[v.Point.x, v.Point.y, v.Point.z] for v in shape.Vertexes])
+    if len(vertices) < 4:
+        return None
+    
+    # Calculate bounding box
+    mins = np.min(vertices, axis=0)
+    maxs = np.max(vertices, axis=0)
+    dimensions = maxs - mins
+    dimensions = np.maximum(dimensions, 0.001)
+    center = np.mean(vertices, axis=0)
+    
+    # Use shape's rotation
+    rot = shape_placement.Rotation.toMatrix()
+    rot_matrix = np.array([
+        [rot.A11, rot.A12, rot.A13],
+        [rot.A21, rot.A22, rot.A23],
+        [rot.A31, rot.A32, rot.A33]
+    ])
+    
+    rotation = matrix_to_rotation(rot_matrix)
+    result = {
+        'dimensions': FreeCAD.Vector(dimensions[0], dimensions[1], dimensions[2]),
+        'rotation': rotation,
+        'center': FreeCAD.Vector(float(center[0]), float(center[1]), float(center[2]))
+    }
+    
+    result['dimensions'] /= 1000.0
+    result['center'].multiply(1/1000.0)
+
+    return result
+
+
+def matrix_to_rotation(matrix):
+    """Convert rotation matrix to FreeCAD rotation"""
+    import numpy as np
+    
+    x_axis = FreeCAD.Vector(float(matrix[0,0]), float(matrix[1,0]), float(matrix[2,0])).normalize()
+    y_axis = FreeCAD.Vector(float(matrix[0,1]), float(matrix[1,1]), float(matrix[2,1])).normalize()
+    z_axis = FreeCAD.Vector(float(matrix[0,2]), float(matrix[1,2]), float(matrix[2,2])).normalize()
+    
+    rot = FreeCAD.Matrix()
+    rot.A11, rot.A12, rot.A13 = x_axis.x, y_axis.x, z_axis.x
+    rot.A21, rot.A22, rot.A23 = x_axis.y, y_axis.y, z_axis.y
+    rot.A31, rot.A32, rot.A33 = x_axis.z, y_axis.z, z_axis.z
+    
+    return FreeCAD.Rotation(rot)
+
+
+def create_bbox_visualization(shape, bbox_info):
+    """Create visual bounding box"""
+    # Convert dimensions back to millimeters (they were converted to meters earlier)
+    dimensions = [d * 1000.0 for d in bbox_info['dimensions']]
+    rotation = bbox_info['rotation']
+    
+    bbox = FreeCAD.ActiveDocument.addObject("Part::Box", f"MinBBox")
+    bbox.Length = float(dimensions[0])
+    bbox.Width = float(dimensions[1])
+    bbox.Height = float(dimensions[2])
+    
+    # Use shape's bounding box for initial positioning
+    shape_bbox = shape.BoundBox
+    
+    shape_center = FreeCAD.Vector(
+        (shape_bbox.XMin + shape_bbox.XMax) / 2,
+        (shape_bbox.YMin + shape_bbox.YMax) / 2,
+        (shape_bbox.ZMin + shape_bbox.ZMax) / 2
+    )
+    
+    if hasattr(shape, 'Placement'):
+        shape_placement = shape.Placement
+    else:
+        parent = [obj for obj in FreeCAD.ActiveDocument.Objects if hasattr(obj, 'Shape') and obj.Shape == shape]
+        if parent:
+            shape_placement = parent[0].Placement
+        else:
+            shape_placement = FreeCAD.Placement()
+    
+    box_center = FreeCAD.Vector(bbox.Length/2, bbox.Width/2, bbox.Height/2)
+    
+    final_position = shape_placement.multVec(shape_center) - rotation.multVec(box_center)
+    
+    bbox.Placement.Base = final_position - shape_placement.Base
+    bbox.Placement.Rotation = rotation
+    
+    bbox.ViewObject.Transparency = 70
+    bbox.ViewObject.ShapeColor = (0.0, 1.0, 0.0)
+
+
+def resolve_link_chain(obj):
+    if not hasattr(obj, "Placement"):
+        return obj, None
+    
+    placement = obj.Placement
+    base = obj
+    visited = set()
+
+    while hasattr(base, "LinkedObject") and base.LinkedObject:
+        if base in visited:
+            raise RuntimeError("Circular Link detected")
+        visited.add(base)
+        base = base.LinkedObject
+        placement = placement.multiply(base.Placement)
+
+    return base, placement
+
+
+def placement_to_matrix(placement):
+    rot = placement.Rotation.toMatrix()
+    pos = placement.Base
+
+    return [
+        rot.A11, rot.A21, rot.A31, 0,
+        rot.A12, rot.A22, rot.A32, 0,
+        rot.A13, rot.A23, rot.A33, 0,
+        pos.x,   pos.y,   pos.z,   1
+    ]
+
+
+def modify_gltf_data(gltf_data, materials, varsets, matrices):
     """GLTF data modification"""
 
     if not isinstance(gltf_data, dict):
@@ -94,6 +237,14 @@ def modify_gltf_data(gltf_data, materials, varsets):
                 if "extras" not in node:
                     node["extras"] = {}
                 node["extras"].update(varsets[node["name"]])
+
+    # Inject matrix data
+    if "nodes" in gltf_data and matrices:
+        for node in gltf_data["nodes"]:
+            if isinstance(node, dict) and "name" in node and node["name"] in matrices:
+                if "extras" not in node:
+                    node["extras"] = {}
+                node["extras"].update({"world_to_body": matrices[node["name"]]})
 
     return gltf_data
 
@@ -129,7 +280,7 @@ def process_glb_file(filename, gltf_data):
 def export(objects, filename):
     """GLTF/GLB export with proper material names and metadata"""
 
-    _, materials, varsets = traverse_objects_once(objects)
+    _, materials, varsets, matrices = traverse_objects_once(objects)
 
     export_objects = [obj for obj in objects if hasattr(obj, "Shape") and obj.Shape]
 
@@ -142,7 +293,7 @@ def export(objects, filename):
         with open(filename, "r", encoding="utf-8") as f:
             gltf_data = json.load(f)
 
-        gltf_data = modify_gltf_data(gltf_data, materials, varsets)
+        gltf_data = modify_gltf_data(gltf_data, materials, varsets, matrices)
 
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(gltf_data, f, indent=2)
@@ -165,5 +316,5 @@ def export(objects, filename):
             json_data = f.read(json_length)
             gltf_data = json.loads(json_data.decode("utf-8"))
 
-        gltf_data = modify_gltf_data(gltf_data, materials, varsets)
+        gltf_data = modify_gltf_data(gltf_data, materials, varsets, matrices)
         process_glb_file(filename, gltf_data)
